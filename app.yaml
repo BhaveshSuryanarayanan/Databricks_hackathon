@@ -4,5 +4,5 @@ command: [
   "app.py"
 ]
 env:
-  - name: SARVAM_API_KEY
+  - name: sarvam_api_key
     valueFrom: nyaya_secrets/sarvam_api_key
