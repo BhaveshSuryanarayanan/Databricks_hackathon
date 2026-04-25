@@ -21,10 +21,15 @@ SARVAM_API_KEY   = os.getenv("SARVAM_API_KEY", "")
 SARVAM_API_BASE  = os.getenv("SARVAM_API_BASE", "https://api.sarvam.ai/v1")
 
 # Decide which endpoint to use
-USE_SARVAM_DIRECT = bool(SARVAM_API_KEY)
-LLM_BASE_URL = SARVAM_API_BASE if USE_SARVAM_DIRECT else HF_BASE_URL
-LLM_API_KEY  = SARVAM_API_KEY  if USE_SARVAM_DIRECT else HF_TOKEN
-LLM_MODEL    = "sarvam-m"      if USE_SARVAM_DIRECT else SARVAM_MODEL
+LLM_BASE_URL = "https://api.sarvam.ai/v1"
+LLM_API_KEY  = os.getenv("SARVAM_API_KEY")
+LLM_MODEL    = "sarvam-m"
+
+if not LLM_API_KEY:
+    raise ValueError("SARVAM_API_KEY is not set. Check Databricks secrets.")
+
+print("API KEY LOADED:", bool(LLM_API_KEY))
+print(f"[Config] LLM endpoint: {LLM_BASE_URL} | Model: {LLM_MODEL}")
 
 # ── Data Paths ──────────────────────────────────────────────────────────────────
 BNS_CSV_PATH          = Path(os.getenv("BNS_CSV_PATH",          ROOT / "bns_sections.csv"))
