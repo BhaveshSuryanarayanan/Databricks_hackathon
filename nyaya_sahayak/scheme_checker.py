@@ -1,228 +1,278 @@
 """
 Government scheme eligibility checker for Nyaya-Sahayak.
-Matches user profile to relevant central/state government schemes using LangExtract + LLM.
+Primary:  Databricks Mosaic AI Vector Search on schemes_gold_index (3400+ schemes).
+Fallback: Local data.parquet keyword search.
 """
 
 from __future__ import annotations
-import sys, json
+import re
+import sys
 from pathlib import Path
 from typing import Optional
+
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from nyaya_sahayak.config import SCHEMES_JSON_PATH
 from nyaya_sahayak.llm_client import chat
 
-# ── Scheme Database ─────────────────────────────────────────────────────────────
-BUILT_IN_SCHEMES = [
-    {"id":"PM_AWAS","name":"PM Awas Yojana (PMAY)","hindi_name":"प्रधानमंत्री आवास योजना",
-     "category":"Housing","ministry":"MoHUA",
-     "description":"Affordable housing for urban/rural poor. Subsidy on home loans.",
-     "eligibility":{"income_max_lpa":18,"age_min":18,"beneficiary":"EWS/LIG/MIG families","asset":"No pucca house"},
-     "benefit":"Subsidy up to ₹2.67 lakh on home loan","url":"https://pmaymis.gov.in"},
-    {"id":"MGNREGS","name":"MGNREGA","hindi_name":"मनरेगा",
-     "category":"Employment","ministry":"MoRD",
-     "description":"100 days guaranteed wage employment per year for rural households.",
-     "eligibility":{"age_min":18,"location":"Rural","work_type":"Manual labour"},
-     "benefit":"100 days employment @ ₹220-350/day (state-wise)","url":"https://nrega.nic.in"},
-    {"id":"PM_JAN","name":"PM Jan Dhan Yojana","hindi_name":"प्रधानमंत्री जन धन योजना",
-     "category":"Banking","ministry":"MoF",
-     "description":"Zero-balance bank account with RuPay debit card and ₹2 lakh accident insurance.",
-     "eligibility":{"age_min":10,"documents":"Aadhaar/PAN/Voter ID"},
-     "benefit":"Free bank account + ₹2L accident cover + ₹30K life cover","url":"https://pmjdy.gov.in"},
-    {"id":"AYUSHMAN","name":"Ayushman Bharat PM-JAY","hindi_name":"आयुष्मान भारत",
-     "category":"Health","ministry":"MoHFW",
-     "description":"Health insurance cover of ₹5 lakh per family per year for secondary/tertiary care.",
-     "eligibility":{"income_max_lpa":2.5,"secc":"Listed in SECC 2011 database","family_size":"Any"},
-     "benefit":"₹5 lakh/family/year health cover at empanelled hospitals","url":"https://pmjay.gov.in"},
-    {"id":"PM_KISAN","name":"PM Kisan Samman Nidhi","hindi_name":"पीएम किसान",
-     "category":"Agriculture","ministry":"MoA",
-     "description":"Direct income support of ₹6,000/year to small and marginal farmers.",
-     "eligibility":{"occupation":"Farmer","land_holding_max_acres":5,"documents":"Land record + Aadhaar"},
-     "benefit":"₹6,000/year in 3 instalments","url":"https://pmkisan.gov.in"},
-    {"id":"NIRBHAYA","name":"Nirbhaya Fund Schemes","hindi_name":"निर्भया फंड",
-     "category":"Women Safety","ministry":"MoWCD",
-     "description":"Multiple schemes for safety, rehabilitation of women survivors of violence.",
-     "eligibility":{"gender":"Female","situation":"Survivor of sexual/domestic violence"},
-     "benefit":"Legal aid, rehabilitation, one-stop centres, helpline 181","url":"https://wcd.nic.in"},
-    {"id":"SAKSHAM","name":"Saksham Yojana (Divyang)","hindi_name":"सक्षम योजना",
-     "category":"Disability","ministry":"MoSJE",
-     "description":"Scholarship and assistance for differently-abled students.",
-     "eligibility":{"disability_pct_min":40,"age_max":25,"education":"Post-matric"},
-     "benefit":"Scholarship ₹3,500-₹38,500/year based on course","url":"https://scholarships.gov.in"},
-    {"id":"PM_MUDRA","name":"PM MUDRA Yojana","hindi_name":"मुद्रा योजना",
-     "category":"MSME/Business","ministry":"MoF",
-     "description":"Collateral-free loans for small businesses and entrepreneurs.",
-     "eligibility":{"business_type":"Non-farm enterprise","loan_max_lakh":20},
-     "benefit":"Loans: Shishu (≤50K), Kishore (50K-5L), Tarun (5L-20L)","url":"https://mudra.org.in"},
-    {"id":"SUKANYA","name":"Sukanya Samriddhi Yojana","hindi_name":"सुकन्या समृद्धि योजना",
-     "category":"Girl Child","ministry":"MoF",
-     "description":"Savings scheme for girl child with higher interest rate and tax benefits.",
-     "eligibility":{"gender":"Female","age_max":10},
-     "benefit":"8.2% interest, tax-free, maturity at age 21","url":"https://ssymis.gov.in"},
-    {"id":"UJJWALA","name":"PM Ujjwala Yojana","hindi_name":"उज्ज्वला योजना",
-     "category":"LPG/Energy","ministry":"MoPNG",
-     "description":"Free LPG connection to women from BPL households.",
-     "eligibility":{"gender":"Female","income":"BPL household","no_lpg":True},
-     "benefit":"Free LPG connection + first cylinder","url":"https://pmuy.gov.in"},
-    {"id":"SCHOLARSHIP_SC","name":"Post-Matric Scholarship (SC/ST)","hindi_name":"अनुसूचित जाति/जनजाति छात्रवृत्ति",
-     "category":"Education","ministry":"MoSJE/MoTA",
-     "description":"Scholarship for SC/ST students pursuing post-matric education.",
-     "eligibility":{"caste":"SC or ST","income_max_lpa":2.5,"education":"Post-matric"},
-     "benefit":"Full tuition + maintenance allowance","url":"https://scholarships.gov.in"},
-    {"id":"LEGAL_AID","name":"National Legal Services Authority (NALSA)","hindi_name":"राष्ट्रीय विधिक सेवा प्राधिकरण",
-     "category":"Legal Aid","ministry":"MoLJ",
-     "description":"Free legal services to marginalized citizens.",
-     "eligibility":{"any":["SC/ST","Woman","Child","Disabled","Income below ₹3L/year","Victim of disaster/trafficking"]},
-     "benefit":"Free lawyer, legal advice, Lok Adalat access","url":"https://nalsa.gov.in"},
-]
+PARQUET_PATH = Path(__file__).parent.parent / "data.parquet"
+MYSCHEME_BASE = "https://www.myscheme.gov.in/schemes"
+DBX_ENDPOINT  = "nyaya_sahayak_endpoint"
+DBX_INDEX     = "legal_catalog.nyaya_sahayak.schemes_gold_index"
+DBX_COLUMNS   = ["scheme_name", "slug", "benefits", "eligibility", "schemeCategory", "level", "tags"]
 
 
-class SchemeChecker:
-    """Match user profile to government schemes."""
+def _tokenize(text: str) -> list[str]:
+    return re.sub(r"[^\w\s]", "", str(text).lower()).split()
+
+
+def _profile_to_query(profile: dict) -> str:
+    """Convert a structured profile dict into a keyword-rich search query."""
+    parts = []
+
+    gender = profile.get("gender", "").lower()
+    caste = profile.get("caste", "").lower()
+    location = profile.get("location", "").lower()
+    occupation = profile.get("occupation", "").lower()
+    age = int(profile.get("age", 30))
+    income = float(profile.get("annual_income_lpa", 5.0))
+
+    if "female" in gender or "f" == gender:
+        parts += ["women", "woman", "female", "girl", "mahila"]
+    elif "male" in gender:
+        parts += ["men", "man", "male"]
+
+    if caste in ("sc", "scheduled caste"):
+        parts += ["scheduled caste", "SC", "dalit", "marginalized", "backward"]
+    if caste in ("st", "scheduled tribe"):
+        parts += ["scheduled tribe", "ST", "tribal", "adivasi", "marginalized"]
+    if caste == "obc":
+        parts += ["OBC", "other backward class", "backward"]
+
+    if location == "rural":
+        parts += ["rural", "village", "panchayat", "gram sabha"]
+    elif location == "urban":
+        parts += ["urban", "city", "municipal", "town"]
+
+    if "farmer" in occupation:
+        parts += ["farmer", "agriculture", "agricultural", "kisan", "crop", "cultivation", "farming"]
+    if "student" in occupation or profile.get("is_student"):
+        parts += ["student", "scholarship", "education", "study", "college", "school", "training"]
+    if "self-employed" in occupation or "business" in occupation or profile.get("is_entrepreneur"):
+        parts += ["self-employed", "entrepreneur", "business", "MSME", "enterprise", "loan", "MUDRA"]
+    if "unemployed" in occupation:
+        parts += ["unemployment", "job", "employment", "skill training", "livelihood"]
+    if "salaried" in occupation:
+        parts += ["salaried", "worker", "employee", "employment"]
+
+    if income < 2.5 or profile.get("is_bpl"):
+        parts += ["BPL", "below poverty line", "low income", "poor", "economically weaker", "EWS", "ration card"]
+    elif income < 5:
+        parts += ["low income", "EWS", "marginalized", "financial assistance"]
+
+    if profile.get("has_disability"):
+        parts += ["disabled", "disability", "differently abled", "handicapped", "divyang", "specially abled"]
+    if profile.get("is_violence_survivor"):
+        parts += ["violence", "survivor", "victim", "domestic violence", "sexual assault", "nirbhaya", "women safety", "rehabilitation"]
+    if profile.get("needs_legal_aid"):
+        parts += ["legal aid", "legal assistance", "free lawyer", "NALSA", "legal services", "legal help"]
+    if profile.get("has_agricultural_land"):
+        parts += ["farmer", "agriculture", "kisan", "land", "crop", "farming", "PM kisan"]
+    if profile.get("has_girl_child"):
+        parts += ["girl child", "daughter", "sukanya", "beti bachao", "girl education", "girl welfare"]
+    if profile.get("no_lpg"):
+        parts += ["LPG", "gas connection", "cooking fuel", "ujjwala", "cylinder"]
+    if profile.get("is_student"):
+        parts += ["scholarship", "education", "tuition", "fee", "stipend"]
+
+    if age < 18:
+        parts += ["child", "minor", "children welfare", "youth"]
+    elif age < 30:
+        parts += ["youth", "young", "skill development"]
+    elif age >= 60:
+        parts += ["senior citizen", "elderly", "old age", "pension", "vridha"]
+
+    return " ".join(parts)
+
+
+class SchemeSearchEngine:
+    """
+    Searches 3400+ schemes.
+    Primary:  Databricks Mosaic AI Vector Search (semantic).
+    Fallback: Local data.parquet keyword overlap.
+    """
 
     def __init__(self):
-        self.schemes = []
+        self._dbx_index = None          # Mosaic AI vector index
+        self.df: Optional[pd.DataFrame] = None   # local fallback
+        self._token_sets: list[set] = []
 
-    def load(self) -> "SchemeChecker":
-        if SCHEMES_JSON_PATH.exists():
-            self.schemes = json.loads(SCHEMES_JSON_PATH.read_text(encoding="utf-8"))
-        else:
-            self.schemes = BUILT_IN_SCHEMES
-            SCHEMES_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
-            SCHEMES_JSON_PATH.write_text(json.dumps(BUILT_IN_SCHEMES, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"[Schemes] Loaded {len(self.schemes)} schemes")
+    def load(self) -> "SchemeSearchEngine":
+        # 1. Try Databricks Vector Search
+        try:
+            from databricks.vector_search.client import VectorSearchClient
+            client = VectorSearchClient(disable_notice=True)
+            self._dbx_index = client.get_index(
+                endpoint_name=DBX_ENDPOINT,
+                index_name=DBX_INDEX,
+            )
+            print("[Schemes] Databricks Vector Search connected ✅")
+        except Exception as e:
+            print(f"[Schemes] Databricks unavailable, using local parquet fallback. Error: {e}")
+            self._dbx_index = None
+
+        # 2. Always load local parquet as fallback
+        if PARQUET_PATH.exists():
+            self.df = pd.read_parquet(PARQUET_PATH)
+            self.df = self.df.drop(columns=["Unnamed: 9"], errors="ignore")
+            self.df["_content"] = (
+                self.df["scheme_name"].fillna("") + " "
+                + self.df["eligibility"].fillna("") + " "
+                + self.df["benefits"].fillna("") + " "
+                + self.df["schemeCategory"].fillna("") + " "
+                + self.df["tags"].fillna("")
+            )
+            self._token_sets = [set(_tokenize(c)) for c in self.df["_content"]]
+            print(f"[Schemes] Local parquet loaded ({len(self.df)} schemes)")
+
         return self
 
-    # ── Rule-Based Pre-filter ───────────────────────────────────────────────────
+    def _search_databricks(self, query: str, top_k: int) -> list[dict]:
+        """Semantic search via Mosaic AI Vector Search."""
+        results = self._dbx_index.similarity_search(
+            query_text=query,
+            columns=DBX_COLUMNS,
+            num_results=top_k,
+        )
+        rows = results.get("result", {}).get("data_array", [])
+        out = []
+        for i, row in enumerate(rows):
+            # columns order: scheme_name, slug, benefits, eligibility, schemeCategory, level, tags
+            slug = str(row[1]).strip() if len(row) > 1 else ""
+            out.append({
+                "name":        str(row[0]).strip(),
+                "slug":        slug,
+                "benefit":     str(row[2])[:250].strip() if len(row) > 2 else "",
+                "description": str(row[3])[:150].strip() if len(row) > 3 else "",
+                "category":    str(row[4]).strip()       if len(row) > 4 else "",
+                "level":       str(row[5]).strip()       if len(row) > 5 else "",
+                "tags":        str(row[6]).strip()       if len(row) > 6 else "",
+                "url":         f"{MYSCHEME_BASE}/{slug}" if slug else "",
+                "_score":      top_k - i,   # rank-based score
+                "hindi_name":  "",
+            })
+        return out
 
-    def _rule_match_score(self, scheme: dict, profile: dict) -> int:
-        """Simple rule-based scoring (higher = better match)."""
-        score = 0
-        el = scheme.get("eligibility", {})
+    def _search_local(self, query: str, top_k: int) -> list[dict]:
+        """Keyword overlap search on local parquet."""
+        if self.df is None:
+            return []
+        query_tokens = set(_tokenize(query))
+        scores = [len(query_tokens & s) for s in self._token_sets]
+        self.df["_score"] = scores
+        matched = self.df[self.df["_score"] > 0].sort_values("_score", ascending=False).head(top_k)
+        return self._format_local(matched)
 
-        age = int(profile.get("age", 99))
-        income = float(profile.get("annual_income_lpa", 999))
-        gender = profile.get("gender", "").lower()
-        occupation = profile.get("occupation", "").lower()
-        caste = profile.get("caste", "").lower()
-        location = profile.get("location", "").lower()
-        has_disability = profile.get("has_disability", False)
-        is_survivor = profile.get("is_violence_survivor", False)
-        needs_legal_aid = profile.get("needs_legal_aid", False)
-        is_student = profile.get("is_student", False)
-        has_land = profile.get("has_agricultural_land", False)
-        is_entrepreneur = profile.get("is_entrepreneur", False)
-        has_girl_child = profile.get("has_girl_child", False)
-        is_bpl = profile.get("is_bpl", False)
-        no_lpg = profile.get("no_lpg", False)
+    def _format_local(self, df: pd.DataFrame) -> list[dict]:
+        out = []
+        for _, row in df.iterrows():
+            slug = str(row.get("slug", "")).strip()
+            out.append({
+                "name":        str(row["scheme_name"]).strip(),
+                "category":    str(row.get("schemeCategory", "")).strip(),
+                "benefit":     str(row.get("benefits", ""))[:250].strip(),
+                "description": str(row.get("eligibility", ""))[:150].strip(),
+                "url":         f"{MYSCHEME_BASE}/{slug}" if slug else "",
+                "_score":      int(row.get("_score", 0)),
+                "hindi_name":  "",
+                "level":       str(row.get("level", "")).strip(),
+                "tags":        str(row.get("tags", "")).strip(),
+            })
+        return out
 
-        # Income check
-        if "income_max_lpa" in el and income <= el["income_max_lpa"]: score += 3
-        # Age check
-        if "age_min" in el and age >= el["age_min"]: score += 1
-        if "age_max" in el and age <= el["age_max"]: score += 1
-        # Gender
-        if "gender" in el:
-            if el["gender"].lower() == gender: score += 3
-        # Occupation
-        if "occupation" in el and el["occupation"].lower() in occupation: score += 3
-        # Caste
-        if "caste" in el:
-            el_caste = el["caste"].lower()
-            if "sc" in el_caste and "sc" in caste: score += 4
-            if "st" in el_caste and "st" in caste: score += 4
-        # Location
-        if "location" in el and el["location"].lower() in location: score += 2
-        # Disability
-        if has_disability and scheme["category"] == "Disability": score += 5
-        # Violence survivor
-        if is_survivor and scheme["category"] == "Women Safety": score += 5
-        # Legal aid
-        if needs_legal_aid and scheme["category"] == "Legal Aid": score += 5
-        # Student
-        if is_student and scheme["category"] == "Education": score += 3
-        # Farmer
-        if has_land and scheme["category"] == "Agriculture": score += 4
-        # Entrepreneur
-        if is_entrepreneur and scheme["category"] == "MSME/Business": score += 4
-        # Girl child
-        if has_girl_child and scheme["category"] == "Girl Child": score += 5
-        # BPL
-        if is_bpl and scheme["category"] == "LPG/Energy" and no_lpg: score += 5
-        if is_bpl: score += 1  # Small bonus for BPL across schemes
-        # NALSA any-match
-        if "any" in el:
-            for cond in el["any"]:
-                cond_l = cond.lower()
-                if ("sc" in cond_l and "sc" in caste) or ("st" in cond_l and "st" in caste): score += 3; break
-                if "woman" in cond_l and "f" in gender: score += 3; break
-                if "child" in cond_l and age < 18: score += 3; break
-                if "disabled" in cond_l and has_disability: score += 3; break
+    def search(self, query: str, top_k: int = 5) -> list[dict]:
+        """Search schemes — Databricks first, local fallback."""
+        if self._dbx_index:
+            try:
+                return self._search_databricks(query, top_k)
+            except Exception as e:
+                print(f"[Schemes] Databricks query failed, falling back: {e}")
+        return self._search_local(query, top_k)
 
-        return score
-
-    # ── Main Eligibility Check ──────────────────────────────────────────────────
+    def _format_results(self, df: pd.DataFrame) -> list[dict]:
+        results = []
+        for _, row in df.iterrows():
+            slug = str(row.get("slug", "")).strip()
+            results.append({
+                "name": str(row["scheme_name"]).strip(),
+                "category": str(row.get("schemeCategory", "General")).strip(),
+                "benefit": str(row.get("benefits", ""))[:250].strip(),
+                "description": str(row.get("eligibility", ""))[:150].strip(),
+                "url": f"{MYSCHEME_BASE}/{slug}" if slug else "",
+                "_score": int(row.get("_score", 0)),
+                "hindi_name": "",
+                "level": str(row.get("level", "")).strip(),
+                "tags": str(row.get("tags", "")).strip(),
+                "application": str(row.get("application", ""))[:300].strip(),
+            })
+        return results
 
     def check_eligibility(self, profile: dict, language: str = "en") -> dict:
-        """
-        Match profile to schemes. Returns top matches + LLM explanation.
-        
-        Profile keys (all optional):
-          age, annual_income_lpa, gender, caste, location (urban/rural),
-          occupation, is_student, has_disability, is_violence_survivor,
-          needs_legal_aid, has_agricultural_land, is_entrepreneur,
-          has_girl_child, is_bpl, no_lpg
-        """
-        scored = []
-        for scheme in self.schemes:
-            score = self._rule_match_score(scheme, profile)
-            if score > 0:
-                scored.append({**scheme, "_score": score})
+        """Search schemes from profile, return top matches + LLM explanation."""
+        query = _profile_to_query(profile)
+        top_matches = self.search(query, top_k=5)
 
-        scored.sort(key=lambda x: x["_score"], reverse=True)
-        top_matches = scored[:5]  # Top 5
-
-        # Build LLM explanation
-        profile_str = json.dumps({k: v for k, v in profile.items() if v}, ensure_ascii=False)
-        schemes_str = "\n".join([f"- {s['name']}: {s['benefit']}" for s in top_matches]) or "None found"
+        # LLM explanation
+        profile_summary = ", ".join(
+            f"{k}: {v}" for k, v in profile.items() if v and v is not False
+        )
+        schemes_summary = "\n".join(
+            f"- {s['name']} ({s['category']}): {s['benefit'][:120]}"
+            for s in top_matches
+        ) or "None found"
 
         if language == "hi":
-            prompt = f"""उपयोगकर्ता की प्रोफ़ाइल: {profile_str}
+            prompt = f"""उपयोगकर्ता की प्रोफ़ाइल: {profile_summary}
 
 मिलान की गई सरकारी योजनाएं:
-{schemes_str}
+{schemes_summary}
 
 कृपया इन योजनाओं के बारे में सरल हिंदी में बताएं और आवेदन कैसे करें यह भी समझाएं।"""
         else:
-            prompt = f"""User profile: {profile_str}
+            prompt = f"""User profile: {profile_summary}
 
-Matched government schemes:
-{schemes_str}
+Top matched government schemes:
+{schemes_summary}
 
-Explain these schemes in simple language and how the user can apply. 
-Mention any documents they may need."""
+Explain these schemes in simple language — what each offers, who qualifies, and how to apply. Mention key documents needed."""
 
-        explanation = chat([{"role": "user", "content": prompt}], language=language, max_tokens=600)
+        explanation = chat(
+            [{"role": "user", "content": prompt}],
+            language=language,
+            max_tokens=700,
+        )
 
         return {
             "matched_schemes": top_matches,
-            "total_matched": len(scored),
+            "total_matched": len(top_matches),
             "explanation": explanation,
             "profile": profile,
         }
 
     def get_categories(self) -> list[str]:
-        return sorted(set(s["category"] for s in self.schemes))
+        if self.df is None:
+            return []
+        return sorted(self.df["schemeCategory"].dropna().unique().tolist())
 
 
 # ── Singleton ────────────────────────────────────────────────────────────────────
-_checker: Optional[SchemeChecker] = None
+_checker: Optional[SchemeSearchEngine] = None
 
-def get_checker() -> SchemeChecker:
+
+def get_checker() -> SchemeSearchEngine:
     global _checker
     if _checker is None:
-        _checker = SchemeChecker().load()
+        _checker = SchemeSearchEngine().load()
     return _checker
 
 
@@ -230,7 +280,8 @@ if __name__ == "__main__":
     checker = get_checker()
     result = checker.check_eligibility({
         "age": 25, "gender": "female", "annual_income_lpa": 1.5,
-        "caste": "SC", "location": "rural", "is_student": True
+        "caste": "sc", "location": "rural", "is_student": True,
+        "has_girl_child": True,
     })
     for s in result["matched_schemes"]:
-        print(f"[{s['_score']}] {s['name']}: {s['benefit']}")
+        print(f"[{s['_score']}] {s['name']} | {s['category']} | {s['benefit'][:80]}")

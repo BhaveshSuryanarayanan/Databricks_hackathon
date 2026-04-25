@@ -233,6 +233,88 @@ Reply with ONLY the category name, nothing else."""
     return result if result in valid else "chatbot"
 
 
+FIR_SYSTEM_PROMPT = """You are an expert Indian legal document drafter specializing in First Information Reports (FIRs) under the Bharatiya Nyaya Sanhita 2023 (BNS).
+
+You will be given:
+- Complainant details
+- Incident details (description, date, time, place)
+- Accused details (if known)
+- Witness details (if any)
+- Relevant BNS sections retrieved from the incident description
+
+Your task is to draft a formal, legally precise FIR in the following structure:
+
+---
+FIRST INFORMATION REPORT
+(Under Section 173 BNS / As per CrPC Section 154)
+
+FIR No.: [To be assigned by Police Station]
+Date of Filing: {date}
+Police Station: [To be filled by Officer]
+District: [To be filled by Officer]
+
+---
+PART I — COMPLAINANT INFORMATION
+Name:
+Address:
+Contact:
+Relationship to Incident:
+
+---
+PART II — INCIDENT DETAILS
+Date of Incident:
+Time of Incident:
+Place of Incident:
+Nature of Offence:
+
+---
+PART III — DESCRIPTION OF INCIDENT
+[Detailed factual account in formal language, first person, past tense. 3-5 paragraphs.]
+
+---
+PART IV — ACCUSED DETAILS
+[If known, else write "Unknown at this time"]
+
+---
+PART V — WITNESSES
+[If any, else write "None known at this time"]
+
+---
+PART VI — APPLICABLE BNS SECTIONS
+[List each section with its name and a one-line reason why it applies]
+
+---
+PART VII — RELIEF SOUGHT
+[State what action the complainant requests from police]
+
+---
+DECLARATION
+I, [complainant name], hereby declare that the information given above is true and correct to the best of my knowledge and belief.
+
+Signature of Complainant: _______________
+Date: _______________
+---
+
+Rules:
+- Use ONLY BNS sections provided in the context — do not invent or hallucinate section numbers
+- Write in formal, precise legal English
+- Keep the incident description factual — no emotional language
+- If the incident description suggests sections not in the provided context, note them as "Further investigation may reveal additional applicable sections"
+- Do NOT add sections from IPC — only BNS is currently in force"""
+
+
+SUMMARIZE_PROMPT = """You are compressing a legal conversation into memory bullets for a future LLM call.
+
+Extract ONLY concrete facts worth remembering:
+- Specific BNS/IPC sections already discussed
+- The user's legal situation (accused / victim / general inquiry)
+- Key facts established (crime type, location, parties, outcome so far)
+- Questions already fully answered (so they are not repeated)
+- Any unresolved questions the user still has
+
+Output 4-6 tight bullet points. No filler, no vague summaries. Every bullet must be a specific, reusable fact."""
+
+
 ROUTER_SYSTEM_PROMPT = """You are a legal query router for an Indian law assistant.
 
 You have access to two knowledge bases:
@@ -305,9 +387,11 @@ def answer_with_context(
     ipc_context: str,
     language: str = "auto",
     max_tokens: int = MAX_TOKENS_ANSWER,
+    chat_summary: str = "",
+    recent_turns: list = [],
 ) -> str:
     """
-    Generate a final answer given retrieved IPC and/or BNS context.
+    Generate a final answer given retrieved IPC/BNS context and optional conversation memory.
     """
     sections = []
     if ipc_context:
@@ -315,21 +399,87 @@ def answer_with_context(
     if bns_context:
         sections.append(f"[BNS CONTEXT — New Law (Bharatiya Nyaya Sanhita 2023)]\n{bns_context}")
 
-    context_block = "\n\n" + "\n\n---\n\n".join(sections) if sections else "[No relevant sections found in the knowledge base.]"
+    context_block = "\n\n---\n\n".join(sections) if sections else "[No relevant sections found in the knowledge base.]"
 
-    user_message = f"""{context_block}
+    memory_block = f"[CONVERSATION MEMORY]\n{chat_summary}\n\n" if chat_summary else ""
 
----
+    current_message = f"""{memory_block}[LEGAL CONTEXT]\n{context_block}\n\n---\n\nUser Question: {question}"""
 
-User Question: {question}"""
+    # Build messages: inject recent turns as real conversation history
+    messages = []
+    for role, content in recent_turns:
+        messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": current_message})
 
     system = ANSWER_SYSTEM_PROMPT_HI if language == "hi" else ANSWER_SYSTEM_PROMPT_EN
     return chat(
-        [{"role": "user", "content": user_message}],
+        messages,
         language=language,
         max_tokens=max_tokens,
         temperature=TEMPERATURE_LEGAL,
         _system_override=system,
+    )
+
+
+def generate_fir(
+    complainant_name: str,
+    complainant_address: str,
+    complainant_contact: str,
+    incident_date: str,
+    incident_time: str,
+    incident_place: str,
+    incident_description: str,
+    accused_details: str,
+    witness_details: str,
+    bns_context: str,
+    language: str = "en",
+) -> str:
+    """Draft a formal FIR using complainant details and retrieved BNS sections."""
+    user_message = f"""Draft a formal FIR using the details below.
+
+COMPLAINANT DETAILS:
+- Name: {complainant_name}
+- Address: {complainant_address}
+- Contact: {complainant_contact}
+
+INCIDENT DETAILS:
+- Date: {incident_date}
+- Time: {incident_time}
+- Place: {incident_place}
+- Description: {incident_description}
+
+ACCUSED DETAILS:
+{accused_details if accused_details.strip() else "Unknown at this time"}
+
+WITNESS DETAILS:
+{witness_details if witness_details.strip() else "None known at this time"}
+
+RETRIEVED BNS SECTIONS (use ONLY these):
+{bns_context if bns_context else "[No sections retrieved — note this in the FIR]"}"""
+
+    return chat(
+        [{"role": "user", "content": user_message}],
+        language=language,
+        max_tokens=1800,
+        temperature=0.15,
+        _system_override=FIR_SYSTEM_PROMPT,
+    )
+
+
+def summarize_conversation(chat_summary: str, recent_turns: list) -> str:
+    """Compress conversation history into bullet-point memory."""
+    turns_text = "\n".join(
+        f"{role.upper()}: {content}" for role, content in recent_turns
+    )
+    prior = f"[EXISTING SUMMARY]\n{chat_summary}\n\n" if chat_summary else ""
+    prompt = f"{prior}[RECENT CONVERSATION]\n{turns_text}\n\nCompress all of the above into 4-6 bullet points."
+
+    return chat(
+        [{"role": "user", "content": prompt}],
+        language="en",
+        max_tokens=200,
+        temperature=0.1,
+        _system_override=SUMMARIZE_PROMPT,
     )
 
 

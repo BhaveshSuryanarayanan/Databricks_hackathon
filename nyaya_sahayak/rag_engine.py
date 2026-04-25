@@ -354,12 +354,19 @@ class NyayaRAGEngine:
             parts.append(f"**{r.get('title','Section')}**\n{r.get('text','')}")
         return "\n\n---\n\n".join(parts)
 
-    def agentic_query(self, question: str, language: str = "auto", top_k: int = 3) -> str:
+    def agentic_query(
+        self,
+        question: str,
+        language: str = "auto",
+        top_k: int = 3,
+        chat_summary: str = "",
+        recent_turns: list = [],
+    ) -> str:
         """
         Two-step tool-calling pipeline:
           1. Router LLM decides which index(es) to query (bns / ipc / both)
           2. Fetch top_k results from each selected index
-          3. Answer LLM generates final response from labeled IPC + BNS context
+          3. Answer LLM generates final response with labeled context + conversation memory
         """
         from nyaya_sahayak.llm_client import route_query, answer_with_context
 
@@ -382,6 +389,8 @@ class NyayaRAGEngine:
             bns_context=bns_context,
             ipc_context=ipc_context,
             language=language,
+            chat_summary=chat_summary,
+            recent_turns=recent_turns,
         )
 
 

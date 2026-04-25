@@ -178,3 +178,56 @@ bns_gold.write.format("delta") \
 print("✅ BNS Gold Table Created successfully!")
 
 print("🚀 All three Gold tables are fully structured and ready for Vector Indexing.")
+
+
+# COMMAND ----------
+
+# ==========================================
+# 5. PROCESS SCHEMES TABLE (data.parquet)
+# ==========================================
+# Upload data.parquet to:
+#   /Volumes/legal_catalog/nyaya_sahayak/schemes/data.parquet
+# before running this cell.
+
+from pyspark.sql.functions import concat_ws, col, coalesce, lit
+
+schemes_raw = spark.read.parquet(
+    "/Volumes/legal_catalog/nyaya_sahayak/schemes/data.parquet"
+)
+
+# Drop junk column if present
+if "Unnamed: 9" in schemes_raw.columns:
+    schemes_raw = schemes_raw.drop("Unnamed: 9")
+
+# Build a rich content column for vector embedding:
+# scheme_name + eligibility + benefits + category + tags
+schemes_gold = schemes_raw.withColumn(
+    "content",
+    concat_ws(
+        "\n",
+        coalesce(col("scheme_name"), lit("")),
+        coalesce(col("eligibility"),  lit("")),
+        coalesce(col("benefits"),     lit("")),
+        coalesce(col("schemeCategory"), lit("")),
+        coalesce(col("tags"),         lit("")),
+    )
+).select(
+    "scheme_name",
+    "slug",
+    "benefits",
+    "eligibility",
+    "application",
+    "schemeCategory",
+    "level",
+    "tags",
+    "content",      # ← embedded by vector search
+)
+
+spark.sql("DROP TABLE IF EXISTS legal_catalog.nyaya_sahayak.schemes_gold")
+schemes_gold.write.format("delta") \
+    .option("delta.enableChangeDataFeed", "true") \
+    .mode("overwrite") \
+    .saveAsTable("legal_catalog.nyaya_sahayak.schemes_gold")
+
+print(f"✅ Schemes Gold Table Created! ({schemes_gold.count()} schemes)")
+print("🚀 Now create a Mosaic AI Vector Search index on 'content' column via the Databricks UI or SDK.")
