@@ -17,7 +17,7 @@ HF_BASE_URL      = os.getenv("HF_BASE_URL", "https://api-inference.huggingface.c
 SARVAM_MODEL     = os.getenv("SARVAM_MODEL", "sarvamai/sarvam-m")
 
 # Optional direct Sarvam API (faster)
-SARVAM_API_KEY   = os.getenv("SARVAM_API_KEY", "")
+sarvam_api_key   = os.getenv("sarvam_api_key", "")
 SARVAM_API_BASE  = os.getenv("SARVAM_API_BASE", "https://api.sarvam.ai/v1")
 
 # Decide which endpoint to use
